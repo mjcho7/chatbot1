@@ -93,6 +93,52 @@ def format_context(documents: list[Document]) -> str:
     )
 
 
+def format_conversation_history(messages: list[dict[str, object]], limit: int = 6) -> str:
+    """최근 대화를 검색어 보정과 질문 해석에 쓸 수 있는 짧은 문자열로 만듭니다."""
+    recent_messages = messages[-limit:]
+    if not recent_messages:
+        return "(이전 대화 없음)"
+
+    history_lines: list[str] = []
+    for message in recent_messages:
+        role = "사용자" if message.get("role") == "user" else "챗봇"
+        # 지나치게 긴 답변이 다음 요청의 문맥을 모두 차지하지 않도록 길이를 제한합니다.
+        content = str(message.get("content", "")).strip()[:600]
+        if content:
+            history_lines.append(f"{role}: {content}")
+    return "\n".join(history_lines) or "(이전 대화 없음)"
+
+
+def rewrite_search_query(
+    question: str, conversation_history: str, api_key: str
+) -> str:
+    """후속 질문을 문서 검색에 적합한 독립 질문으로 보정합니다."""
+    if conversation_history == "(이전 대화 없음)":
+        return question
+
+    # 답변을 만들지 않고 검색할 질문 한 문장만 반환하도록 별도 Runnable을 구성합니다.
+    rewrite_prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                """당신은 문서 검색을 위한 질문 보정 도우미입니다.
+이전 대화에서 지시 대상이나 생략된 표현만 보완하여 현재 질문을 독립적인 검색 질문으로 바꾸세요.
+답변하거나 새로운 사실을 추가하지 말고, 검색 질문 한 문장만 한국어로 반환하세요.""",
+            ),
+            ("human", "이전 대화:\n{history}\n\n현재 질문: {question}"),
+        ]
+    )
+    rewrite_chain = (
+        rewrite_prompt
+        | ChatOpenAI(model=CHAT_MODEL, api_key=api_key, temperature=0)
+        | StrOutputParser()
+    )
+    rewritten_query = rewrite_chain.invoke(
+        {"history": conversation_history, "question": question}
+    ).strip()
+    return rewritten_query or question
+
+
 def evidence_sentence(text: str, limit: int = 300) -> str:
     """출처 아래에 표시할 읽기 쉬운 근거 문장(원문 발췌)을 만듭니다."""
     clean_text = re.sub(r"\s+", " ", text).strip()
@@ -186,18 +232,30 @@ def main() -> None:
             st.markdown(message["content"])
             # 버튼을 클릭해 화면이 다시 실행되어도, 저장해 둔 출처를 다시 표시합니다.
             if message["role"] == "assistant" and message.get("sources"):
+                if message.get("search_query"):
+                    with st.expander("검색에 사용한 질문"):
+                        st.write(message["search_query"])
                 render_sources(message["sources"], key_prefix=f"history-{message_index}")
 
     question = st.chat_input("문서에 관해 질문해 보세요")
     if not question:
         return
 
+    # 현재 질문을 저장하기 전의 기록만 사용해야 같은 질문이 두 번 들어가지 않습니다.
+    conversation_history = format_conversation_history(st.session_state.messages)
     st.session_state.messages.append({"role": "user", "content": question})
     with st.chat_message("user"):
         st.markdown(question)
 
-    # 최신 Runnable 방식: retriever와 prompt, model, parser를 조합합니다.
-    retrieved_documents = vector_store.similarity_search(question, k=4)
+    # 최신 Runnable 방식으로 후속 질문을 독립적인 검색 질문으로 보정합니다.
+    try:
+        search_query = rewrite_search_query(question, conversation_history, api_key)
+    except Exception as error:
+        # 검색어 보정에 실패해도 원래 질문으로 검색해 챗봇 사용이 중단되지 않게 합니다.
+        st.warning(f"검색어 보정에 실패해 원래 질문으로 검색합니다: {error}")
+        search_query = question
+
+    retrieved_documents = vector_store.similarity_search(search_query, k=4)
     context = format_context(retrieved_documents)
     prompt = ChatPromptTemplate.from_messages(
         [
@@ -206,9 +264,14 @@ def main() -> None:
                 """당신은 제공된 문서만 근거로 답하는 도우미입니다.
 문맥에 답이 없거나 근거가 부족하면 반드시 '제공된 문서에서 확인할 수 없습니다.'라고 답하세요.
 문맥에 없는 사실을 추측하거나 일반 지식으로 보완하지 마세요.
+이전 대화는 현재 질문의 지시 대상과 생략된 표현을 해석하는 데만 사용하세요.
+답변의 사실 근거는 반드시 아래 문서 문맥에서만 찾고, 이전 대화를 근거로 삼지 마세요.
 답변은 한국어로 간결하고 명확하게 작성하세요.""",
             ),
-            ("human", "문맥:\n{context}\n\n질문: {question}"),
+            (
+                "human",
+                "이전 대화:\n{history}\n\n문서 문맥:\n{context}\n\n현재 질문: {question}",
+            ),
         ]
     )
     chain = prompt | ChatOpenAI(model=CHAT_MODEL, api_key=api_key, temperature=0) | StrOutputParser()
@@ -216,11 +279,19 @@ def main() -> None:
     with st.chat_message("assistant"):
         with st.spinner("문서 근거를 바탕으로 답변을 작성하고 있습니다..."):
             try:
-                answer = chain.invoke({"context": context, "question": question})
+                answer = chain.invoke(
+                    {
+                        "history": conversation_history,
+                        "context": context,
+                        "question": question,
+                    }
+                )
             except Exception as error:
                 st.error(f"답변 생성에 실패했습니다: {error}")
                 return
         st.markdown(answer)
+        with st.expander("검색에 사용한 질문"):
+            st.write(search_query)
         sources = [
             {
                 "source": str(document.metadata["source"]),
@@ -233,7 +304,12 @@ def main() -> None:
 
     # 출처까지 대화 기록에 저장해야 다음 화면 실행에서도 버튼이 동작합니다.
     st.session_state.messages.append(
-        {"role": "assistant", "content": answer, "sources": sources}
+        {
+            "role": "assistant",
+            "content": answer,
+            "sources": sources,
+            "search_query": search_query,
+        }
     )
 
 
