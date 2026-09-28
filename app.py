@@ -23,6 +23,7 @@ EMBEDDING_MODEL = "text-embedding-3-small"
 CHAT_MODEL = "gpt-4o-mini"
 RETRIEVER_K = 4
 MAX_CONTEXT_PAGES = 8
+MAX_DISPLAY_SOURCES = 3
 
 
 def get_openai_api_key() -> str | None:
@@ -148,11 +149,30 @@ def format_conversation_history(messages: list[dict[str, object]], limit: int = 
     return "\n".join(history_lines) or "(이전 대화 없음)"
 
 
+def format_recent_user_questions(
+    messages: list[dict[str, object]], limit: int = 2
+) -> str:
+    """후속 질문의 검색 대상을 분명히 하기 위해 최근 사용자 질문만 모읍니다."""
+    user_questions = [
+        str(message.get("content", "")).strip()
+        for message in messages
+        if message.get("role") == "user" and str(message.get("content", "")).strip()
+    ]
+    return "\n".join(user_questions[-limit:]) or "(이전 사용자 질문 없음)"
+
+
+def combine_search_query(previous_user_questions: str, rewritten_query: str) -> str:
+    """이전 사용자 질문의 주제와 보정된 후속 질문을 함께 벡터 검색에 전달합니다."""
+    if previous_user_questions == "(이전 사용자 질문 없음)":
+        return rewritten_query
+    return f"이전 사용자 질문: {previous_user_questions}\n현재 검색 질문: {rewritten_query}"
+
+
 def rewrite_search_query(
-    question: str, conversation_history: str, api_key: str
+    question: str, previous_user_questions: str, api_key: str
 ) -> str:
     """후속 질문을 문서 검색에 적합한 독립 질문으로 보정합니다."""
-    if conversation_history == "(이전 대화 없음)":
+    if previous_user_questions == "(이전 사용자 질문 없음)":
         return question
 
     # 답변을 만들지 않고 검색할 질문 한 문장만 반환하도록 별도 Runnable을 구성합니다.
@@ -163,9 +183,13 @@ def rewrite_search_query(
                 """당신은 문서 검색을 위한 질문 보정 도우미입니다.
 이전 대화에서 지시 대상이나 생략된 표현만 보완하여 현재 질문을 독립적인 검색 질문으로 바꾸세요.
 금액·횟수·날짜가 맞는지 묻는 짧은 후속 질문은 이전 대화의 대상과 기존 값을 반드시 포함해 구체화하세요.
+이전 챗봇 답변은 검색어를 만드는 근거로 사용하지 마세요. 이전 사용자 질문만 사용하세요.
 답변하거나 새로운 사실을 추가하지 말고, 검색 질문 한 문장만 한국어로 반환하세요.""",
             ),
-            ("human", "이전 대화:\n{history}\n\n현재 질문: {question}"),
+            (
+                "human",
+                "이전 사용자 질문:\n{previous_user_questions}\n\n현재 질문: {question}",
+            ),
         ]
     )
     rewrite_chain = (
@@ -174,7 +198,7 @@ def rewrite_search_query(
         | StrOutputParser()
     )
     rewritten_query = rewrite_chain.invoke(
-        {"history": conversation_history, "question": question}
+        {"previous_user_questions": previous_user_questions, "question": question}
     ).strip()
     return rewritten_query or question
 
@@ -182,8 +206,17 @@ def rewrite_search_query(
 def evidence_sentence(text: str, limit: int = 300) -> str:
     """출처 아래에 표시할 읽기 쉬운 근거 문장(원문 발췌)을 만듭니다."""
     clean_text = re.sub(r"\s+", " ", text).strip()
-    sentences = re.split(r"(?<=[.!?。])\s+", clean_text)
-    excerpt = next((sentence for sentence in sentences if sentence.strip()), clean_text)
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?。])\s+|\s*•\s*", clean_text)
+        if sentence.strip()
+    ]
+    # 질문 제목보다 지급 기준이 담긴 답변 문장을 먼저 보여 줍니다.
+    evidence_words = ("정액", "지급", "만원", "가능", "불가", "제외")
+    excerpt = next(
+        (sentence for sentence in sentences if any(word in sentence for word in evidence_words)),
+        sentences[0] if sentences else clean_text,
+    )
     return excerpt[:limit] + ("…" if len(excerpt) > limit else "")
 
 
@@ -222,7 +255,7 @@ def show_source_page(source: str, page_number: int) -> None:
 def render_sources(sources: list[dict[str, str | int]], key_prefix: str) -> None:
     """답변에 연결된 출처와 원문 페이지 열기 버튼을 화면에 표시합니다."""
     st.markdown("#### 출처와 근거 문장")
-    for index, source_info in enumerate(sources, start=1):
+    for index, source_info in enumerate(sources[:MAX_DISPLAY_SOURCES], start=1):
         source = str(source_info["source"])
         page = int(source_info["page"])
         st.markdown(f"**{index}. {source} (p. {page})**")
@@ -283,17 +316,23 @@ def main() -> None:
 
     # 현재 질문을 저장하기 전의 기록만 사용해야 같은 질문이 두 번 들어가지 않습니다.
     conversation_history = format_conversation_history(st.session_state.messages)
+    previous_user_questions = format_recent_user_questions(st.session_state.messages)
     st.session_state.messages.append({"role": "user", "content": question})
     with st.chat_message("user"):
         st.markdown(question)
 
     # 최신 Runnable 방식으로 후속 질문을 독립적인 검색 질문으로 보정합니다.
     try:
-        search_query = rewrite_search_query(question, conversation_history, api_key)
+        rewritten_query = rewrite_search_query(
+            question, previous_user_questions, api_key
+        )
     except Exception as error:
         # 검색어 보정에 실패해도 원래 질문으로 검색해 챗봇 사용이 중단되지 않게 합니다.
         st.warning(f"검색어 보정에 실패해 원래 질문으로 검색합니다: {error}")
-        search_query = question
+        rewritten_query = question
+
+    # 이전 사용자 질문의 주제를 반드시 포함해, 짧은 후속 질문도 같은 문서 영역을 검색합니다.
+    search_query = combine_search_query(previous_user_questions, rewritten_query)
 
     retrieved_documents = vector_store.similarity_search(search_query, k=RETRIEVER_K)
     # 검색된 페이지뿐 아니라 이어지는 페이지도 포함해 Q&A의 답변 문장이 누락되지 않게 합니다.
