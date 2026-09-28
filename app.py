@@ -21,6 +21,8 @@ PROJECT_DIR = Path(__file__).resolve().parent
 DATA_DIR = PROJECT_DIR / "DATA"
 EMBEDDING_MODEL = "text-embedding-3-small"
 CHAT_MODEL = "gpt-4o-mini"
+RETRIEVER_K = 4
+MAX_CONTEXT_PAGES = 8
 
 
 def get_openai_api_key() -> str | None:
@@ -65,6 +67,15 @@ def load_pdf_documents(paths: list[Path]) -> list[Document]:
 
 
 @st.cache_resource(show_spinner=False)
+def load_source_pages(
+    data_signature: tuple[tuple[str, int, int], ...]
+) -> list[Document]:
+    """검색 결과 주변 페이지를 보강할 수 있도록 원문 페이지를 한 번만 읽습니다."""
+    _ = data_signature
+    return load_pdf_documents(get_pdf_paths())
+
+
+@st.cache_resource(show_spinner=False)
 def build_vector_store(
     api_key: str, data_signature: tuple[tuple[str, int, int], ...]
 ) -> InMemoryVectorStore:
@@ -91,6 +102,34 @@ def format_context(documents: list[Document]) -> str:
         f"[파일: {doc.metadata['source']} | 페이지: {doc.metadata['page']}]\n{doc.page_content}"
         for doc in documents
     )
+
+
+def expand_with_neighbor_pages(
+    retrieved_documents: list[Document], source_pages: list[Document]
+) -> list[Document]:
+    """Q&A가 다음 쪽에 이어지는 PDF 특성을 고려해 앞뒤 페이지를 함께 제공합니다."""
+    page_lookup = {
+        (str(document.metadata["source"]), int(document.metadata["page"])): document
+        for document in source_pages
+    }
+    selected_keys: list[tuple[str, int]] = []
+
+    # 우선순위가 높은 검색 결과 자체를 먼저 넣습니다.
+    for document in retrieved_documents:
+        key = (str(document.metadata["source"]), int(document.metadata["page"]))
+        if key not in selected_keys:
+            selected_keys.append(key)
+
+    # 상위 결과의 전후 페이지에는 질문의 답변, 예외, 표가 이어질 수 있습니다.
+    for document in retrieved_documents[:3]:
+        source = str(document.metadata["source"])
+        page = int(document.metadata["page"])
+        for neighbor_page in (page - 1, page + 1):
+            neighbor_key = (source, neighbor_page)
+            if neighbor_key in page_lookup and neighbor_key not in selected_keys:
+                selected_keys.append(neighbor_key)
+
+    return [page_lookup[key] for key in selected_keys[:MAX_CONTEXT_PAGES] if key in page_lookup]
 
 
 def format_conversation_history(messages: list[dict[str, object]], limit: int = 6) -> str:
@@ -123,6 +162,7 @@ def rewrite_search_query(
                 "system",
                 """당신은 문서 검색을 위한 질문 보정 도우미입니다.
 이전 대화에서 지시 대상이나 생략된 표현만 보완하여 현재 질문을 독립적인 검색 질문으로 바꾸세요.
+금액·횟수·날짜가 맞는지 묻는 짧은 후속 질문은 이전 대화의 대상과 기존 값을 반드시 포함해 구체화하세요.
 답변하거나 새로운 사실을 추가하지 말고, 검색 질문 한 문장만 한국어로 반환하세요.""",
             ),
             ("human", "이전 대화:\n{history}\n\n현재 질문: {question}"),
@@ -255,8 +295,12 @@ def main() -> None:
         st.warning(f"검색어 보정에 실패해 원래 질문으로 검색합니다: {error}")
         search_query = question
 
-    retrieved_documents = vector_store.similarity_search(search_query, k=4)
-    context = format_context(retrieved_documents)
+    retrieved_documents = vector_store.similarity_search(search_query, k=RETRIEVER_K)
+    # 검색된 페이지뿐 아니라 이어지는 페이지도 포함해 Q&A의 답변 문장이 누락되지 않게 합니다.
+    context_documents = expand_with_neighbor_pages(
+        retrieved_documents, load_source_pages(get_data_signature(pdf_paths))
+    )
+    context = format_context(context_documents)
     prompt = ChatPromptTemplate.from_messages(
         [
             (
@@ -266,6 +310,7 @@ def main() -> None:
 문맥에 없는 사실을 추측하거나 일반 지식으로 보완하지 마세요.
 이전 대화는 현재 질문의 지시 대상과 생략된 표현을 해석하는 데만 사용하세요.
 답변의 사실 근거는 반드시 아래 문서 문맥에서만 찾고, 이전 대화를 근거로 삼지 마세요.
+현재 질문이 이전 답변의 금액·횟수·날짜를 정정하거나 확인하는 내용이면, 문서 문맥의 수치와 직접 비교해 답하세요.
 답변은 한국어로 간결하고 명확하게 작성하세요.""",
             ),
             (
@@ -298,7 +343,7 @@ def main() -> None:
                 "page": int(document.metadata["page"]),
                 "evidence": evidence_sentence(document.page_content),
             }
-            for document in retrieved_documents
+            for document in context_documents
         ]
         render_sources(sources, key_prefix=f"current-{len(st.session_state.messages)}")
 
