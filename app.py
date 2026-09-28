@@ -149,30 +149,11 @@ def format_conversation_history(messages: list[dict[str, object]], limit: int = 
     return "\n".join(history_lines) or "(이전 대화 없음)"
 
 
-def format_recent_user_questions(
-    messages: list[dict[str, object]], limit: int = 2
-) -> str:
-    """후속 질문의 검색 대상을 분명히 하기 위해 최근 사용자 질문만 모읍니다."""
-    user_questions = [
-        str(message.get("content", "")).strip()
-        for message in messages
-        if message.get("role") == "user" and str(message.get("content", "")).strip()
-    ]
-    return "\n".join(user_questions[-limit:]) or "(이전 사용자 질문 없음)"
-
-
-def combine_search_query(previous_user_questions: str, rewritten_query: str) -> str:
-    """이전 사용자 질문의 주제와 보정된 후속 질문을 함께 벡터 검색에 전달합니다."""
-    if previous_user_questions == "(이전 사용자 질문 없음)":
-        return rewritten_query
-    return f"이전 사용자 질문: {previous_user_questions}\n현재 검색 질문: {rewritten_query}"
-
-
 def rewrite_search_query(
-    question: str, previous_user_questions: str, api_key: str
+    question: str, conversation_history: str, api_key: str
 ) -> str:
-    """후속 질문을 문서 검색에 적합한 독립 질문으로 보정합니다."""
-    if previous_user_questions == "(이전 사용자 질문 없음)":
+    """이전 질문·답변과 후속 질문을 하나의 독립 검색 질문으로 만듭니다."""
+    if conversation_history == "(이전 대화 없음)":
         return question
 
     # 답변을 만들지 않고 검색할 질문 한 문장만 반환하도록 별도 Runnable을 구성합니다.
@@ -181,14 +162,15 @@ def rewrite_search_query(
             (
                 "system",
                 """당신은 문서 검색을 위한 질문 보정 도우미입니다.
-이전 대화에서 지시 대상이나 생략된 표현만 보완하여 현재 질문을 독립적인 검색 질문으로 바꾸세요.
-금액·횟수·날짜가 맞는지 묻는 짧은 후속 질문은 이전 대화의 대상과 기존 값을 반드시 포함해 구체화하세요.
-이전 챗봇 답변은 검색어를 만드는 근거로 사용하지 마세요. 이전 사용자 질문만 사용하세요.
-답변하거나 새로운 사실을 추가하지 말고, 검색 질문 한 문장만 한국어로 반환하세요.""",
+이전 질문, 이전 답변, 현재 후속 질문을 함께 읽고 문서 검색에 쓸 독립적인 질문 한 문장으로 다시 작성하세요.
+현재 질문이 금액·횟수·날짜의 정정 또는 확인이면, 이전 질문의 대상과 이전 답변의 비교 대상 수치를 모두 포함하세요.
+예를 들어 '3만원 아니야?'는 무엇의 금액인지와 2만원·3만원 중 무엇을 확인할지 분명히 적어야 합니다.
+이전 답변은 검색 주제를 복원하는 단서일 뿐 사실로 확정하지 마세요. 답하거나 새로운 사실을 추가하지 마세요.
+검색 질문 한 문장만 한국어로 반환하세요.""",
             ),
             (
                 "human",
-                "이전 사용자 질문:\n{previous_user_questions}\n\n현재 질문: {question}",
+                "이전 대화:\n{conversation_history}\n\n현재 질문: {question}",
             ),
         ]
     )
@@ -198,7 +180,7 @@ def rewrite_search_query(
         | StrOutputParser()
     )
     rewritten_query = rewrite_chain.invoke(
-        {"previous_user_questions": previous_user_questions, "question": question}
+        {"conversation_history": conversation_history, "question": question}
     ).strip()
     return rewritten_query or question
 
@@ -211,11 +193,25 @@ def evidence_sentence(text: str, limit: int = 300) -> str:
         for sentence in re.split(r"(?<=[.!?。])\s+|\s*•\s*", clean_text)
         if sentence.strip()
     ]
-    # 질문 제목보다 지급 기준이 담긴 답변 문장을 먼저 보여 줍니다.
-    evidence_words = ("정액", "지급", "만원", "가능", "불가", "제외")
-    excerpt = next(
-        (sentence for sentence in sentences if any(word in sentence for word in evidence_words)),
-        sentences[0] if sentences else clean_text,
+    # 질문 제목(Q&A, 물음표)보다 실제 답변 문장을 우선합니다.
+    answer_sentences = [
+        sentence
+        for sentence in sentences
+        if "Q&A" not in sentence and not sentence.rstrip().endswith("?")
+    ]
+    # 금액이 있는 문장을 먼저 보여 주면 수치 확인 후속 질문의 근거가 명확합니다.
+    money_excerpt = next(
+        (sentence for sentence in answer_sentences if "만원" in sentence),
+        None,
+    )
+    evidence_words = ("정액", "지급", "가능", "불가", "제외")
+    excerpt = money_excerpt or next(
+        (
+            sentence
+            for sentence in answer_sentences
+            if any(word in sentence for word in evidence_words)
+        ),
+        answer_sentences[0] if answer_sentences else (sentences[0] if sentences else clean_text),
     )
     return excerpt[:limit] + ("…" if len(excerpt) > limit else "")
 
@@ -316,23 +312,22 @@ def main() -> None:
 
     # 현재 질문을 저장하기 전의 기록만 사용해야 같은 질문이 두 번 들어가지 않습니다.
     conversation_history = format_conversation_history(st.session_state.messages)
-    previous_user_questions = format_recent_user_questions(st.session_state.messages)
     st.session_state.messages.append({"role": "user", "content": question})
     with st.chat_message("user"):
         st.markdown(question)
 
-    # 최신 Runnable 방식으로 후속 질문을 독립적인 검색 질문으로 보정합니다.
+    # 이전 질문·답변과 후속 질문을 합쳐, 벡터 검색용 독립 질문 하나를 만듭니다.
     try:
         rewritten_query = rewrite_search_query(
-            question, previous_user_questions, api_key
+            question, conversation_history, api_key
         )
     except Exception as error:
         # 검색어 보정에 실패해도 원래 질문으로 검색해 챗봇 사용이 중단되지 않게 합니다.
         st.warning(f"검색어 보정에 실패해 원래 질문으로 검색합니다: {error}")
         rewritten_query = question
 
-    # 이전 사용자 질문의 주제를 반드시 포함해, 짧은 후속 질문도 같은 문서 영역을 검색합니다.
-    search_query = combine_search_query(previous_user_questions, rewritten_query)
+    # 여러 대화 문장을 그대로 넣는 대신, 보정된 독립 질문만으로 검색해 유사도 혼선을 줄입니다.
+    search_query = rewritten_query
 
     retrieved_documents = vector_store.similarity_search(search_query, k=RETRIEVER_K)
     # 검색된 페이지뿐 아니라 이어지는 페이지도 포함해 Q&A의 답변 문장이 누락되지 않게 합니다.
