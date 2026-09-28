@@ -23,6 +23,20 @@ EMBEDDING_MODEL = "text-embedding-3-small"
 CHAT_MODEL = "gpt-4o-mini"
 
 
+def get_openai_api_key() -> str | None:
+    """Cloud Secrets를 우선 사용하고, 로컬에서는 .env 파일을 사용합니다."""
+    # 로컬 개발 환경에서는 기존 .env 파일의 값을 환경 변수로 불러옵니다.
+    load_dotenv(PROJECT_DIR / ".env")
+    try:
+        # Streamlit Cloud의 Secrets 입력란에 저장한 값은 이 방식으로 읽습니다.
+        cloud_api_key = st.secrets.get("OPENAI_API_KEY")
+    except FileNotFoundError:
+        # 로컬에 secrets.toml이 없는 경우는 정상이며 .env 값을 사용합니다.
+        cloud_api_key = None
+
+    return cloud_api_key or os.getenv("OPENAI_API_KEY")
+
+
 def get_pdf_paths() -> list[Path]:
     """DATA 폴더 안의 모든 PDF 파일 경로를 이름순으로 반환합니다."""
     return sorted(DATA_DIR.glob("*.pdf"))
@@ -135,8 +149,7 @@ def render_sources(sources: list[dict[str, str | int]], key_prefix: str) -> None
 
 def main() -> None:
     """Streamlit 화면을 그리고 질문-검색-답변 흐름을 실행합니다."""
-    load_dotenv(PROJECT_DIR / ".env")
-    api_key = os.getenv("OPENAI_API_KEY")
+    api_key = get_openai_api_key()
 
     st.set_page_config(page_title="공무원 여비 RAG 챗봇", page_icon="📚")
     st.title("📚 공무원 여비 RAG 챗봇")
@@ -147,7 +160,7 @@ def main() -> None:
         st.error("DATA 폴더에 PDF 파일이 없습니다.")
         return
     if not api_key:
-        st.error(".env 파일의 OPENAI_API_KEY를 설정한 뒤 다시 실행해 주세요.")
+        st.error("OPENAI_API_KEY를 .env 또는 Streamlit Cloud Secrets에 설정해 주세요.")
         return
 
     with st.sidebar:
