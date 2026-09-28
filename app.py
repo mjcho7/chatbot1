@@ -1,0 +1,228 @@
+"""DATA 폴더의 PDF를 대상으로 답하는 Streamlit RAG 챗봇입니다."""
+
+import os
+import re
+from pathlib import Path
+
+import pymupdf
+import streamlit as st
+from dotenv import load_dotenv
+from langchain_core.documents import Document
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.vectorstores import InMemoryVectorStore
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from pypdf import PdfReader
+
+
+# 이 파일을 기준으로 DATA 폴더를 찾으므로, 어느 위치에서 실행해도 동작합니다.
+PROJECT_DIR = Path(__file__).resolve().parent
+DATA_DIR = PROJECT_DIR / "DATA"
+EMBEDDING_MODEL = "text-embedding-3-small"
+CHAT_MODEL = "gpt-4o-mini"
+
+
+def get_pdf_paths() -> list[Path]:
+    """DATA 폴더 안의 모든 PDF 파일 경로를 이름순으로 반환합니다."""
+    return sorted(DATA_DIR.glob("*.pdf"))
+
+
+def get_data_signature(paths: list[Path]) -> tuple[tuple[str, int, int], ...]:
+    """파일이 바뀌면 Streamlit 캐시도 새로 만들기 위한 식별값입니다."""
+    return tuple((path.name, path.stat().st_size, path.stat().st_mtime_ns) for path in paths)
+
+
+def load_pdf_documents(paths: list[Path]) -> list[Document]:
+    """PDF의 각 페이지를 LangChain Document로 변환해 파일명과 쪽수를 보존합니다."""
+    documents: list[Document] = []
+    for path in paths:
+        reader = PdfReader(str(path))
+        for page_number, page in enumerate(reader.pages, start=1):
+            text = page.extract_text() or ""
+            if text.strip():
+                documents.append(
+                    Document(
+                        page_content=text,
+                        metadata={"source": path.name, "page": page_number},
+                    )
+                )
+    return documents
+
+
+@st.cache_resource(show_spinner=False)
+def build_vector_store(
+    api_key: str, data_signature: tuple[tuple[str, int, int], ...]
+) -> InMemoryVectorStore:
+    """문서를 청크로 나누고 OpenAI 임베딩으로 InMemoryVectorStore를 만듭니다."""
+    # data_signature는 캐시 무효화에 사용합니다. 함수 안에서는 PDF 목록을 다시 읽습니다.
+    _ = data_signature
+    documents = load_pdf_documents(get_pdf_paths())
+    if not documents:
+        raise ValueError("DATA 폴더에서 읽을 수 있는 PDF 텍스트를 찾지 못했습니다.")
+
+    # 한 청크가 지나치게 길지 않으면서 문맥이 이어지도록 일부를 겹칩니다.
+    splitter = RecursiveCharacterTextSplitter(chunk_size=1_000, chunk_overlap=150)
+    chunks = splitter.split_documents(documents)
+
+    embeddings = OpenAIEmbeddings(model=EMBEDDING_MODEL, api_key=api_key)
+    vector_store = InMemoryVectorStore(embedding=embeddings)
+    vector_store.add_documents(chunks)
+    return vector_store
+
+
+def format_context(documents: list[Document]) -> str:
+    """검색된 문서 조각을 모델에 전달할 문맥 문자열로 바꿉니다."""
+    return "\n\n".join(
+        f"[파일: {doc.metadata['source']} | 페이지: {doc.metadata['page']}]\n{doc.page_content}"
+        for doc in documents
+    )
+
+
+def evidence_sentence(text: str, limit: int = 300) -> str:
+    """출처 아래에 표시할 읽기 쉬운 근거 문장(원문 발췌)을 만듭니다."""
+    clean_text = re.sub(r"\s+", " ", text).strip()
+    sentences = re.split(r"(?<=[.!?。])\s+", clean_text)
+    excerpt = next((sentence for sentence in sentences if sentence.strip()), clean_text)
+    return excerpt[:limit] + ("…" if len(excerpt) > limit else "")
+
+
+@st.cache_data(show_spinner=False)
+def render_pdf_page(source: str, page_number: int, modified_time_ns: int) -> bytes:
+    """원본 PDF의 한 페이지를 화면에 표시할 PNG 이미지로 변환합니다."""
+    # modified_time_ns는 PDF가 갱신되었을 때 이전 이미지 캐시를 쓰지 않게 합니다.
+    _ = modified_time_ns
+    pdf_path = DATA_DIR / source
+    pdf_document = pymupdf.open(pdf_path)
+    try:
+        # 확대 배율을 적용해 작은 글자도 읽기 쉽게 렌더링합니다.
+        page = pdf_document.load_page(page_number - 1)
+        image = page.get_pixmap(matrix=pymupdf.Matrix(1.5, 1.5), alpha=False)
+        return image.tobytes("png")
+    finally:
+        pdf_document.close()
+
+
+@st.dialog("출처 페이지")
+def show_source_page(source: str, page_number: int) -> None:
+    """버튼을 눌렀을 때 원문 PDF의 해당 페이지를 팝업으로 보여 줍니다."""
+    pdf_path = DATA_DIR / source
+    if not pdf_path.is_file():
+        st.error("출처 PDF 파일을 찾지 못했습니다.")
+        return
+
+    st.caption(f"{source} · {page_number}쪽")
+    try:
+        page_image = render_pdf_page(source, page_number, pdf_path.stat().st_mtime_ns)
+        st.image(page_image, use_container_width=True)
+    except Exception as error:
+        st.error(f"출처 페이지를 열지 못했습니다: {error}")
+
+
+def render_sources(sources: list[dict[str, str | int]], key_prefix: str) -> None:
+    """답변에 연결된 출처와 원문 페이지 열기 버튼을 화면에 표시합니다."""
+    st.markdown("#### 출처와 근거 문장")
+    for index, source_info in enumerate(sources, start=1):
+        source = str(source_info["source"])
+        page = int(source_info["page"])
+        st.markdown(f"**{index}. {source} (p. {page})**")
+        st.caption(f"근거 문장: {source_info['evidence']}")
+        # 이전 대화의 출처 버튼과 현재 답변의 버튼이 겹치지 않도록 고유 key를 사용합니다.
+        button_key = f"{key_prefix}-source-page-{index}-{source}-{page}"
+        if st.button("출처 페이지 열기", key=button_key):
+            show_source_page(source, page)
+
+
+def main() -> None:
+    """Streamlit 화면을 그리고 질문-검색-답변 흐름을 실행합니다."""
+    load_dotenv(PROJECT_DIR / ".env")
+    api_key = os.getenv("OPENAI_API_KEY")
+
+    st.set_page_config(page_title="공무원 여비 RAG 챗봇", page_icon="📚")
+    st.title("📚 공무원 여비 RAG 챗봇")
+    st.caption("DATA 폴더의 문서 내용만 근거로 답변합니다.")
+
+    pdf_paths = get_pdf_paths()
+    if not pdf_paths:
+        st.error("DATA 폴더에 PDF 파일이 없습니다.")
+        return
+    if not api_key:
+        st.error(".env 파일의 OPENAI_API_KEY를 설정한 뒤 다시 실행해 주세요.")
+        return
+
+    with st.sidebar:
+        st.subheader("색인 문서")
+        for path in pdf_paths:
+            st.write(f"- {path.name}")
+        if st.button("문서 색인 다시 만들기"):
+            st.cache_resource.clear()
+            st.rerun()
+
+    try:
+        with st.spinner("문서를 읽고 검색 인덱스를 준비하고 있습니다..."):
+            vector_store = build_vector_store(api_key, get_data_signature(pdf_paths))
+    except Exception as error:
+        st.error(f"문서 색인 생성에 실패했습니다: {error}")
+        return
+
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+
+    for message_index, message in enumerate(st.session_state.messages):
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+            # 버튼을 클릭해 화면이 다시 실행되어도, 저장해 둔 출처를 다시 표시합니다.
+            if message["role"] == "assistant" and message.get("sources"):
+                render_sources(message["sources"], key_prefix=f"history-{message_index}")
+
+    question = st.chat_input("문서에 관해 질문해 보세요")
+    if not question:
+        return
+
+    st.session_state.messages.append({"role": "user", "content": question})
+    with st.chat_message("user"):
+        st.markdown(question)
+
+    # 최신 Runnable 방식: retriever와 prompt, model, parser를 조합합니다.
+    retrieved_documents = vector_store.similarity_search(question, k=4)
+    context = format_context(retrieved_documents)
+    prompt = ChatPromptTemplate.from_messages(
+        [
+            (
+                "system",
+                """당신은 제공된 문서만 근거로 답하는 도우미입니다.
+문맥에 답이 없거나 근거가 부족하면 반드시 '제공된 문서에서 확인할 수 없습니다.'라고 답하세요.
+문맥에 없는 사실을 추측하거나 일반 지식으로 보완하지 마세요.
+답변은 한국어로 간결하고 명확하게 작성하세요.""",
+            ),
+            ("human", "문맥:\n{context}\n\n질문: {question}"),
+        ]
+    )
+    chain = prompt | ChatOpenAI(model=CHAT_MODEL, api_key=api_key, temperature=0) | StrOutputParser()
+
+    with st.chat_message("assistant"):
+        with st.spinner("문서 근거를 바탕으로 답변을 작성하고 있습니다..."):
+            try:
+                answer = chain.invoke({"context": context, "question": question})
+            except Exception as error:
+                st.error(f"답변 생성에 실패했습니다: {error}")
+                return
+        st.markdown(answer)
+        sources = [
+            {
+                "source": str(document.metadata["source"]),
+                "page": int(document.metadata["page"]),
+                "evidence": evidence_sentence(document.page_content),
+            }
+            for document in retrieved_documents
+        ]
+        render_sources(sources, key_prefix=f"current-{len(st.session_state.messages)}")
+
+    # 출처까지 대화 기록에 저장해야 다음 화면 실행에서도 버튼이 동작합니다.
+    st.session_state.messages.append(
+        {"role": "assistant", "content": answer, "sources": sources}
+    )
+
+
+if __name__ == "__main__":
+    main()
